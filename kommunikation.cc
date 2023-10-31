@@ -1,0 +1,562 @@
+#include <iostream>
+#include <sys/types.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <arpa/inet.h>
+#include <string.h>
+#include <string>
+#include <wiringPiSPI.h>
+#include <signal.h>
+#include <pthread.h>
+#include "kommunikation.h"
+#include "globala_variabler.h"
+
+using namespace std;
+
+void alarmWakeup(int sig_num);
+
+int fd;
+int fd2;
+unsigned char buffer[100];
+
+int speed = 0;
+int ze_distance = 0;
+
+// channel is the wiringPi name for the chip select (or chip enable) pin.
+// Set this to 0 or 1, depending on how it's connected.
+static const int AVR1_CHANNEL = 1;
+static const int AVR2_CHANNEL = 0;
+
+int get_speed()
+{
+    // Fråga AVR om hastighet
+    // Notera att numera kräver sensorAVR-en att 17 skickas före 42
+    // Ordningen spelar roll
+    buffer[0] = 17;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+
+    buffer[0] = 42;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+    int time_ish = buffer[0];
+    
+    buffer[0] = 43;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+    time_ish = (buffer[0] << 8) | time_ish;
+
+    buffer[0] = 0;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+    int distance_ish = buffer[0];
+
+    float time{time_ish / 125000.0};
+    float distance{distance_ish * 0.314 * 80};
+
+    //cout << distance << "\t" << time << endl;
+    
+    if (time == 0)
+        return 0;
+
+    return static_cast<int>(distance / time);
+}
+
+int get_distance()
+{
+    // Fråga AVR om sträcka
+    // Notera att numera kräver sensorAVR-en att 69 skickas före 22
+    // Ordningen spelar roll
+    int count = 0;
+    buffer[0] = 69;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+
+    buffer[0] = 22;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+    //cout << static_cast<int>(buffer[0]) << "\t";
+    count = buffer[0];
+
+    buffer[0] = 0;
+    wiringPiSPIDataRW(AVR1_CHANNEL, buffer, 1);
+    //cout << static_cast<int>(buffer[0]) << "\t";
+    count |= (buffer[0] << 8);
+
+    int distance{static_cast<int>(count * 3.1415 * 60 / 10)};
+    //cout << distance << endl;
+    return distance;
+}
+
+void send_steering_angle(int steering_angle)
+{
+    buffer[0] = 5;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & steering_angle;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << "Dingus: " << (int)buffer[0];
+
+    buffer[0] = 13;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0];
+    buffer[0] = (steering_angle >> 8);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0] << endl;
+}
+
+void send_reference_speed(int reference_speed)
+{
+    buffer[0] = 10;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & reference_speed;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << "Myrslok: " << (int)buffer[0];
+
+    buffer[0] = 11;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0];
+    buffer[0] = (reference_speed >> 8);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0] << endl;
+    
+    //cout << "Dingus: " << reference_speed << endl;
+}
+
+void send_actual_speed(int speed)
+{
+    buffer[0] = 20;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & speed;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << "Myrslok: " << (int)buffer[0];
+
+    buffer[0] = 21;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0];
+    buffer[0] = (speed >> 8);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    //cout << ", " << (int)buffer[0] << endl;
+}
+
+void send_ip(int ip)
+{
+    buffer[0] = 6;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & ip;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+
+    buffer[0] = 7;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & (ip >> 8);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+
+    buffer[0] = 8;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & (ip >> 16);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+
+    buffer[0] = 9;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    buffer[0] = 0xff & (ip >> 24);
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+}
+
+void send_pi_status(string status)
+{
+    buffer[0] = 12;
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 1);
+    int length{status.length()};
+    if (length > 16)
+        length = 16;
+    copy(status.begin(), status.begin() + length, buffer);
+    for (int i{length}; i < 16; i++)
+    {
+        buffer[i] = ' ';
+    }
+    wiringPiSPIDataRW(AVR2_CHANNEL, buffer, 16);
+}
+void timer_interrupt(int)
+{
+    // Fråga AVR2 om Geschwindischkeit och avstånd.
+    // Spara i lokala variabler först och kopiera sedan till de globala
+    // variablerna innanför mutex-låsningen
+    int dist{get_distance()};
+    int spd{get_speed()};
+    send_actual_speed(spd);
+    mtx.lock();
+    int old_distance{ze_distance};
+    glob_velocity  = spd;
+    ze_distance = dist;
+    mtx.unlock();
+    // Skicka önskad styrvinkel till styrAVR
+    mtx.lock();
+    int steering_angle{glob_steer_angle};
+    int reference_speed{glob_reference_speed};
+    mtx.unlock();
+    send_steering_angle(steering_angle);
+    send_reference_speed(reference_speed);
+    
+    // Skriv ut vad hastigheten och sträckan är
+    //cout << "Hastighet: " << speed << " \tSträcka: " << distance << endl;
+}
+
+void * communicate(void * threadid)
+{
+    cout << "Initializing" << endl ;
+    
+    // Configure the interface.
+    // CHANNEL insicates chip select,
+    // 500000 indicates bus speed.
+    fd  = wiringPiSPISetup(AVR1_CHANNEL, 8000000 / 128 ); // Zensor
+    fd2 = wiringPiSPISetup(AVR2_CHANNEL, 1000000 / 16 ); // Stür
+    cout << "Init result: " << fd << endl;
+    cout << "Init result: " << fd2 << endl;
+
+    //sf::RenderWindow window(sf::VideoMode(800, 600), "test");
+
+    // Create a socket
+    int listening = socket(AF_INET, SOCK_STREAM, 0);
+    if (listening == -1)
+    {
+        cerr << "Can't create a socket! Quitting" << endl;
+        pthread_exit(NULL);
+    }
+
+    // Bind the ip address and port to a socket
+    sockaddr_in hint;
+    hint.sin_family = AF_INET;
+    hint.sin_port = htons(54000);
+    inet_pton(AF_INET, "192.168.0.17", &hint.sin_addr);
+    int ip{};
+    ip = ip | (192 << 24) | (168 << 16) | (0 << 8) | 17;
+    send_ip(ip);
+
+    bind(listening, (sockaddr*)&hint, sizeof(hint));
+
+    // Tell Winsock the socket is for listening
+    listen(listening, SOMAXCONN);
+
+    // Wait for a connection
+    sockaddr_in client;
+    socklen_t clientSize = sizeof(client);
+    send_pi_status("Waiting...");
+    cout << "Waiting..." << endl;
+    // Fråga AVR om hastighet varje millisekund
+    signal(SIGALRM, timer_interrupt);
+    ualarm(50000, 50000);
+    int clientSocket = accept(listening, (sockaddr*)&client, &clientSize);
+    send_pi_status("Connected");
+    char host[NI_MAXHOST];      // Client's remote name
+    char service[NI_MAXSERV];   // Service (i.e. port) the client is connect on
+
+    memset(host, 0, NI_MAXHOST); // same as memset(host, 0, NI_MAXHOST);
+    memset(service, 0, NI_MAXSERV);
+
+    if (getnameinfo((sockaddr*)&client, sizeof(client), host, NI_MAXHOST, service, NI_MAXSERV, 0) == 0)
+    {
+        cout << host << " connected on port " << service << endl;
+    }
+    else
+    {
+        inet_ntop(AF_INET, &client.sin_addr, host, NI_MAXHOST);
+        cout << host << " connected on port " << ntohs(client.sin_port) << endl;
+    }
+
+    // Close listening socket
+    close(listening);
+
+    // While loop: accept and echo message back to client
+    uint8_t buf[8192];
+
+    //string command;
+    //string response;
+    //while (command != "t")
+    //{
+        //memset(buf, 0, 4096);
+    while (true)
+    {
+        // Wait for client to send data
+        int bytesReceived = recv(clientSocket, buf, 8192, 0);
+        if (bytesReceived == -1)
+        {
+            send_pi_status("Er, disconnected");
+            cerr << "Error in re------------------------cv(). Quitting" << endl;
+            break;
+        }
+
+        if (bytesReceived == 0)
+        {
+            send_pi_status("Disconnected");
+            cout << "Client disconnected " << endl;
+            break;
+        }
+
+        int buf_index{0};
+        bool left_pressed{false};
+        bool right_pressed{false};
+        bool up_pressed{false};
+        bool down_pressed{false};
+        bool f_pressed{false};
+        bool s_pressed{false};
+        bool stop_pressed{false};
+        bool fetch_info{false};
+        cout << "Tog emot:" << endl;
+        while (buf_index < bytesReceived)
+        {
+          cout << static_cast<int>(buf[buf_index]) << endl;
+
+          if (buf[buf_index] == 1)
+          {
+            // Upp
+            up_pressed = true;
+          }
+          else if (buf[buf_index] == 2)
+          {
+            // Höger
+            right_pressed = true;
+          }
+          else if (buf[buf_index] == 3)
+          {
+            // Vänster
+            left_pressed = true;
+          }
+          else if (buf[buf_index] == 4)
+          {
+            // Ner
+            down_pressed = true;
+          }
+          else if (buf[buf_index] == 5)
+          {
+            // Hämta information
+            fetch_info = true;
+          }
+          else if (buf[buf_index] == 6)
+          {
+              // Byt till auto-tomatisk körning
+              mtx.lock();
+              glob_manual_mode = false;
+              mtx.unlock();
+          }
+          else if (buf[buf_index] == 7)
+           {
+              // Byt till manuell körning
+              mtx.lock();
+              glob_manual_mode = true;
+              mtx.unlock();
+          }
+          else if (buf[buf_index] == 8)
+          {
+              f_pressed = true;
+          }
+          else if (buf[buf_index] == 9)
+          {
+              s_pressed = true;
+          }
+          else if (buf[buf_index] == 10)   
+          {
+              union float_bytes 
+              {
+                  float the_float;
+                  uint8_t bytes[sizeof(float)];
+              } float_as_bytes;
+              // Skicka reglerfel (avstånd)
+              float_as_bytes.bytes[0] = buf[++buf_index];
+              float_as_bytes.bytes[1] = buf[++buf_index];
+              float_as_bytes.bytes[2] = buf[++buf_index];
+              float_as_bytes.bytes[3] = buf[++buf_index];
+              mtx.lock();
+              glob_stanley_k = float_as_bytes.the_float;
+              mtx.unlock();
+          }
+          if (buf[buf_index] == 0)
+          {
+            // Stanna
+            // Gå till manuellt läge om nödstopp
+            stop_pressed = true;
+            mtx.lock();
+            glob_manual_mode = true;
+            mtx.unlock();
+          }
+          if (buf[buf_index] == 112)
+          {
+              mtx.lock();
+              glob_exit = true;
+              mtx.unlock();
+          }
+          if (buf[buf_index] == 255)
+          {
+            // Denna byte är bara utfyllnad, ignorera
+            ;
+          }
+          buf_index += 1;
+        }
+        cout << "\n" << endl;
+	
+        // Reagera på mottagna styrsignaler
+        int reference_speed = 0;
+        int steering_angle = 0;
+        if (up_pressed && !down_pressed)
+        {
+            if (f_pressed && !s_pressed)
+                reference_speed = 1500;
+            else if (s_pressed && !f_pressed)
+                reference_speed = 550;
+            else
+                reference_speed = 900;
+        }
+        else if (down_pressed && !up_pressed)
+        {
+            if (f_pressed && !s_pressed)
+                reference_speed = -1000;
+            else if (s_pressed && !f_pressed)
+                reference_speed = -600;
+            else 
+                -800;
+        }
+        else 
+        {
+            reference_speed = 0;
+        }
+
+        if (left_pressed && !right_pressed)
+        {
+            steering_angle = 30 * 60;
+        }
+        else if (right_pressed && !left_pressed)
+        {
+            steering_angle = -30 * 60;
+        }
+        else 
+        {
+            steering_angle = 0;
+        }
+
+        if (stop_pressed)
+        {
+            reference_speed = 0;
+        }
+        
+        mtx.lock();
+        if (glob_manual_mode)
+        {
+            glob_steer_angle = steering_angle;
+            glob_reference_speed = reference_speed;
+        }
+
+        mtx.unlock();
+
+        // Echo message back to client
+        //cout << "Skickar till dator" << endl;
+        int num_bytes_to_send{0};
+        mtx.lock();
+        buf[num_bytes_to_send++] = (static_cast<int>(glob_velocity)) & 0xff;
+        buf[num_bytes_to_send++] = ((static_cast<int>(glob_velocity)) >> 8) & 0xff;
+        buf[num_bytes_to_send++] = (static_cast<int>(glob_steer_angle)) & 0xff;
+        buf[num_bytes_to_send++] = ((static_cast<int>(glob_steer_angle)) >> 8) & 0xff;
+        mtx.unlock();
+        buf[num_bytes_to_send++] = ze_distance & 0xff;
+        buf[num_bytes_to_send++] = (ze_distance >> 8) & 0xff;
+        buf[num_bytes_to_send++] = reference_speed & 0xff;
+        buf[num_bytes_to_send++] = (reference_speed >> 8) & 0xff;
+        union float_bytes 
+        {
+            float the_float;
+            uint8_t bytes[sizeof(float)];
+        } float_as_bytes;
+        mtx.lock();
+        float_as_bytes.the_float = glob_e_fa;
+        mtx.unlock();
+        // Skicka reglerfel (avstånd)
+        buf[num_bytes_to_send++] = float_as_bytes.bytes[0];
+        buf[num_bytes_to_send++] = float_as_bytes.bytes[1];
+        buf[num_bytes_to_send++] = float_as_bytes.bytes[2];
+        buf[num_bytes_to_send++] = float_as_bytes.bytes[3];
+
+        if(fetch_info)
+        {
+            mtx.lock();
+            std::vector<int> landm{glob_landmarks};
+            std::vector<int> landm_info{glob_landmark_info};
+            // Skicka bilens position och rotation
+            buf[num_bytes_to_send++] = glob_x & 0xff;
+            buf[num_bytes_to_send++] = (glob_x >> 8) & 0xff;
+            buf[num_bytes_to_send++] = glob_y & 0xff;
+            buf[num_bytes_to_send++] = (glob_y >> 8) & 0xff;
+            buf[num_bytes_to_send++] = glob_ang & 0xff;
+            buf[num_bytes_to_send++] = (glob_ang >> 8) & 0xff;
+            mtx.unlock();
+            // Skicka landmärksantalet
+            buf[num_bytes_to_send++] =  (landm.size()/2) & 0xff;
+            buf[num_bytes_to_send++] = ((landm.size()/2) >> 8) & 0xff;
+            // Skicka alla cylindrars position, storlek och antal gånger de hittats
+            for (int i:landm)
+            {
+                buf[num_bytes_to_send++] = i & 0xff;
+                buf[num_bytes_to_send++] = (i >> 8) & 0xff;
+            }
+            for (int i:landm_info)
+            {
+                buf[num_bytes_to_send++] = i & 0xff;
+                buf[num_bytes_to_send++] = (i >> 8) & 0xff;
+            }
+            mtx.lock();
+            // Skicka de punkter som utgör den planerade vägen
+            buf[num_bytes_to_send++] = glob_path_points.size() & 0xff;
+            buf[num_bytes_to_send++] = (glob_path_points.size() >> 8) & 0xff;
+            for (path_point p : glob_path_points)
+            {
+                buf[num_bytes_to_send++] = p.x_pos & 0xff;
+                buf[num_bytes_to_send++] = (p.x_pos >> 8) & 0xff; 
+                buf[num_bytes_to_send++] = p.y_pos & 0xff;
+                buf[num_bytes_to_send++] = (p.y_pos >> 8) & 0xff; 
+            }
+            // Skicka alla portars positioner och vinklar
+            buf[num_bytes_to_send++] = glob_port_points.size() & 0xff;
+            buf[num_bytes_to_send++] = (glob_port_points.size() >> 8) & 0xff;
+            for (point p : glob_port_points)
+            {
+                buf[num_bytes_to_send++] = p.x_pos & 0xff;
+                buf[num_bytes_to_send++] = (p.x_pos >> 8) & 0xff; 
+                buf[num_bytes_to_send++] = p.y_pos & 0xff;
+                buf[num_bytes_to_send++] = (p.y_pos >> 8) & 0xff; 
+                buf[num_bytes_to_send++] = p.new_angle & 0xff;
+                buf[num_bytes_to_send++] = (p.new_angle >> 8) & 0xff;
+            }
+            // Skicka index för nästa port
+            buf[num_bytes_to_send++] = glob_next_port_index;
+            mtx.unlock();
+        }
+        cout << num_bytes_to_send << " byte skickades " << endl;
+        
+        send(clientSocket, buf, num_bytes_to_send, 0);
+        
+        mtx.lock();
+        bool manual{glob_manual_mode};
+        mtx.unlock();
+        if (manual)
+            cout << "Manuellt läge" << endl;
+        else
+            cout << "Automagiskt läge" << endl;
+
+        //cout << ze_distance << endl;
+        
+        //cout << ((((steering_angle >> 8) & 0xff) << 8) | (steering_angle & 0xff)) << endl;
+        
+        //string response{"Bilen tycker att paprika ar mycket smaskigt!"};
+        //send(clientSocket, response.c_str(), response.size() + 1, 0);
+        
+        // Avsluta om vi ska avsluta
+        mtx.lock();
+        bool exit{glob_exit};
+        mtx.unlock();
+        if (exit)
+        {
+            break;
+        }
+    }
+    
+    mtx.lock();
+    glob_exit = true;
+    mtx.unlock();
+
+    // Close the socket
+    close(clientSocket);
+    pthread_exit(NULL);
+
+}
+
